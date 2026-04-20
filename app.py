@@ -4,12 +4,30 @@ import asyncio
 import threading
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file
+from flask_httpauth import HTTPBasicAuth
+from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
 from engine import FormSender
 
 app = Flask(__name__)
+auth = HTTPBasicAuth()
+
+# ===== Basic認証の設定 =====
+# 環境変数から取得（Renderの環境変数で設定する）
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "password123")
+
+users = {
+    AUTH_USERNAME: generate_password_hash(AUTH_PASSWORD)
+}
+
+@auth.verify_password
+def verify_password(username, password):
+    if username in users and check_password_hash(users.get(username), password):
+        return username
+
+# ===== ディレクトリ作成 =====
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs('uploads', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
@@ -18,10 +36,12 @@ os.makedirs('outputs', exist_ok=True)
 progress_store = {}
 
 @app.route('/')
+@auth.login_required
 def index():
     return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
+@auth.login_required
 def upload():
     file = request.files.get('file')
     if not file:
@@ -29,13 +49,11 @@ def upload():
     path = os.path.join(app.config['UPLOAD_FOLDER'], 'companies.xlsx')
     file.save(path)
 
-    # プレビュー用にデータ読み込み
     df = pd.read_excel(path, sheet_name='協力会社リスト', header=8)
     df.columns = ['No', '会社名', 'URL']
     df = df.dropna(subset=['会社名', 'URL'])
     companies = df[['会社名', 'URL']].to_dict(orient='records')
 
-    # 送信者情報読み込み
     wb = load_workbook(path)
     ws = wb['協力会社リスト']
     sender = {
@@ -48,9 +66,10 @@ def upload():
     return jsonify({'companies': companies, 'sender': sender, 'count': len(companies)})
 
 @app.route('/run', methods=['POST'])
+@auth.login_required
 def run():
     data = request.json
-    mode = data.get('mode', 'test')  # test or production
+    mode = data.get('mode', 'test')
     session_id = datetime.now().strftime('%Y%m%d%H%M%S')
     progress_store[session_id] = {'status': 'running', 'results': [], 'total': 0, 'done': 0}
 
@@ -62,10 +81,12 @@ def run():
     return jsonify({'session_id': session_id})
 
 @app.route('/progress/<session_id>')
+@auth.login_required
 def progress(session_id):
     return jsonify(progress_store.get(session_id, {'status': 'not_found'}))
 
 @app.route('/download/<session_id>')
+@auth.login_required
 def download(session_id):
     path = f'outputs/result_{session_id}.xlsx'
     if os.path.exists(path):
@@ -111,13 +132,12 @@ async def execute(session_id, mode):
 
 def save_result(session_id, results):
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.styles import Font, PatternFill, Border, Side
 
     wb = Workbook()
     thin = Side(style='thin', color='AAAAAA')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    # 全件結果シート
     ws1 = wb.active
     ws1.title = '全件結果'
     headers = ['No.', '会社名', 'ステータス', '失敗理由', '手動対応要否', '送信フォームURL', '実行日時']
@@ -138,7 +158,6 @@ def save_result(session_id, results):
             cell.fill = PatternFill('solid', start_color=color)
             cell.border = border
 
-    # 手動対応リストシート
     ws2 = wb.create_sheet('手動対応リスト')
     h2 = ['No.', '会社名', 'トップページURL', '失敗理由', '対応済み？']
     for col, h in enumerate(h2, 1):
@@ -168,4 +187,5 @@ def save_result(session_id, results):
     wb.save(f'outputs/result_{session_id}.xlsx')
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
