@@ -25,19 +25,44 @@ HTML:
 
 FILL_FORM_PROMPT = """
 あなたはWebフォームの入力専門家です。
-以下のフォームHTMLと送信者情報をもとに、各フィールドへの入力値を教えてください。
+以下のフォームHTMLと送信者情報をもとに、各フィールドへの入力値と
+チェックボックスの選択を決定してください。
 
 送信者情報:
 {sender_json}
 
+問い合わせ種別ヒント（Excelで指定された内容）:
+{inquiry_type}
+
 フォームHTML:
 {form_html}
 
-各inputのname属性またはid属性をキーに、入力値をバリューとしたJSONのみ返してください。
-selectやtextareaも含めてください。
-送信ボタンは含めないでください。
-説明文は不要です。JSONのみ返してください。
-例: {{"name": "山田太郎", "email": "test@example.com", "message": "お問い合わせ内容"}}
+以下のJSON形式のみで返してください。説明文は不要です：
+{{
+  "text_fields": {{
+    "フィールドのnameまたはid": "入力値"
+  }},
+  "checkboxes": [
+    {{
+      "name": "チェックボックスのnameまたはid",
+      "value": "valueの値",
+      "should_check": true,
+      "reason": "チェックする理由"
+    }}
+  ],
+  "selects": {{
+    "selectのnameまたはid": "選択するoption値またはラベル"
+  }}
+}}
+
+チェックボックスの判断基準：
+- 「個人情報」「同意」「プライバシー」「利用規約」→ 必ずtrue
+- 問い合わせ種別は「問い合わせ種別ヒント」に近いものをtrue
+- 「営業」「勧誘」「広告」などはfalse
+- 複数選択可の場合は該当するものすべてtrue
+
+フリガナ・カナ・よみがな フィールドは送信者名をカタカナに変換して入力。
+会社名カナも同様にカタカナで入力。
 """
 
 
@@ -74,13 +99,8 @@ class FormSender:
 
             # Step1: フォームリンクをAIで探す
             analysis = self._call_claude(FIND_FORM_PROMPT + html[:8000])
-            # JSON部分だけ抽出
-            analysis = analysis.strip()
-            if analysis.startswith("```"):
-                analysis = analysis.split("```")[1]
-                if analysis.startswith("json"):
-                    analysis = analysis[4:]
-            data = json.loads(analysis.strip())
+            analysis = self._extract_json(analysis)
+            data = json.loads(analysis)
 
             if data.get('blocked'):
                 result['status'] = 'スキップ'
@@ -95,7 +115,6 @@ class FormSender:
                 await page.close()
                 return result
 
-            # 相対URLを絶対URLに変換
             if form_url.startswith('/'):
                 from urllib.parse import urlparse
                 parsed = urlparse(top_url)
@@ -104,7 +123,6 @@ class FormSender:
             result['form_url'] = form_url
             await page.goto(form_url, timeout=15000)
 
-            # Step2: CAPTCHAチェック
             content = await page.content()
             if 'recaptcha' in content.lower() or 'hcaptcha' in content.lower():
                 result['status'] = '失敗'
@@ -112,40 +130,59 @@ class FormSender:
                 await page.close()
                 return result
 
-            # Step3: PDFチェック
             if form_url.lower().endswith('.pdf'):
                 result['status'] = '失敗'
                 result['reason'] = 'PDFフォーム（対応不可）'
                 await page.close()
                 return result
 
-            # Step4: フォーム入力値をAIで判定
             form_html = await page.inner_html('body')
             prompt = FILL_FORM_PROMPT.format(
                 sender_json=json.dumps(sender, ensure_ascii=False),
+                inquiry_type=sender.get('inquiry_type', '協力会社として取引のご案内'),
                 form_html=form_html[:6000]
             )
             fill_data_str = self._call_claude(prompt)
-            fill_data_str = fill_data_str.strip()
-            if fill_data_str.startswith("```"):
-                fill_data_str = fill_data_str.split("```")[1]
-                if fill_data_str.startswith("json"):
-                    fill_data_str = fill_data_str[4:]
-            fill_data = json.loads(fill_data_str.strip())
+            fill_data_str = self._extract_json(fill_data_str)
+            fill_data = json.loads(fill_data_str)
 
-            # Step5: フォームに入力
-            for key, value in fill_data.items():
+            # テキストフィールド入力
+            for key, value in fill_data.get('text_fields', {}).items():
                 try:
                     locator = page.locator(f'[name="{key}"], [id="{key}"]').first
-                    tag = await locator.evaluate('el => el.tagName.toLowerCase()')
-                    if tag == 'select':
-                        await locator.select_option(label=str(value))
-                    else:
-                        await locator.fill(str(value))
+                    await locator.fill(str(value))
                 except Exception:
                     pass
 
-            # Step6: テストモードは送信しない
+            # チェックボックス操作
+            for cb in fill_data.get('checkboxes', []):
+                try:
+                    name = cb.get('name', '')
+                    value = cb.get('value', '')
+                    should_check = cb.get('should_check', False)
+                    if value:
+                        locator = page.locator(f'input[type="checkbox"][name="{name}"][value="{value}"]').first
+                    else:
+                        locator = page.locator(f'input[type="checkbox"][name="{name}"], input[type="checkbox"][id="{name}"]').first
+                    is_checked = await locator.is_checked()
+                    if should_check and not is_checked:
+                        await locator.check()
+                    elif not should_check and is_checked:
+                        await locator.uncheck()
+                except Exception:
+                    pass
+
+            # セレクトボックス操作
+            for key, value in fill_data.get('selects', {}).items():
+                try:
+                    locator = page.locator(f'select[name="{key}"], select[id="{key}"]').first
+                    try:
+                        await locator.select_option(value=str(value))
+                    except Exception:
+                        await locator.select_option(label=str(value))
+                except Exception:
+                    pass
+
             if self.test_mode:
                 result['status'] = '送信完了（テスト）'
                 result['reason'] = 'テストモードのため実際の送信はしていません'
@@ -163,10 +200,20 @@ class FormSender:
 
         return result
 
+    def _extract_json(self, text):
+        text = text.strip()
+        if text.startswith("```"):
+            parts = text.split("```")
+            if len(parts) >= 2:
+                text = parts[1]
+                if text.startswith("json"):
+                    text = text[4:]
+        return text.strip()
+
     def _call_claude(self, prompt):
         message = self.client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1000,
+            max_tokens=1500,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text
