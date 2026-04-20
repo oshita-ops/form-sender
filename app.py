@@ -13,26 +13,19 @@ from engine import FormSender
 app = Flask(__name__)
 auth = HTTPBasicAuth()
 
-# ===== Basic認証の設定 =====
-# 環境変数から取得（Renderの環境変数で設定する）
 AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "admin")
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "password123")
-
-users = {
-    AUTH_USERNAME: generate_password_hash(AUTH_PASSWORD)
-}
+users = {AUTH_USERNAME: generate_password_hash(AUTH_PASSWORD)}
 
 @auth.verify_password
 def verify_password(username, password):
     if username in users and check_password_hash(users.get(username), password):
         return username
 
-# ===== ディレクトリ作成 =====
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs('uploads', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
 
-# 進捗を保持するグローバル変数
 progress_store = {}
 
 @app.route('/')
@@ -49,21 +42,30 @@ def upload():
     path = os.path.join(app.config['UPLOAD_FOLDER'], 'companies.xlsx')
     file.save(path)
 
-    df = pd.read_excel(path, sheet_name='協力会社リスト', header=8)
-    df.columns = ['No', '会社名', 'URL']
-    df = df.dropna(subset=['会社名', 'URL'])
-    companies = df[['会社名', 'URL']].to_dict(orient='records')
+    try:
+        # 送信者情報読み込み（B列の値を取得）
+        wb = load_workbook(path)
+        ws = wb['協力会社リスト']
+        sender = {
+            '送信者名': ws['B2'].value,
+            '送信者名カナ': ws['B3'].value,
+            '送信者会社名': ws['B4'].value,
+            '送信者会社名カナ': ws['B5'].value,
+            'メール': ws['B6'].value,
+            '電話': ws['B7'].value,
+            '問い合わせ種別': ws['B8'].value,
+            '本文': ws['B9'].value,
+        }
 
-    wb = load_workbook(path)
-    ws = wb['協力会社リスト']
-    sender = {
-        '送信者名': ws['B2'].value,
-        '送信者会社名': ws['B3'].value,
-        'メール': ws['B4'].value,
-        '電話': ws['B5'].value,
-        '本文': ws['B6'].value,
-    }
-    return jsonify({'companies': companies, 'sender': sender, 'count': len(companies)})
+        # 協力会社リスト読み込み（12行目がヘッダー）
+        df = pd.read_excel(path, sheet_name='協力会社リスト', header=11)
+        df.columns = ['No', '会社名', 'URL']
+        df = df.dropna(subset=['会社名', 'URL'])
+        companies = df[['会社名', 'URL']].to_dict(orient='records')
+
+        return jsonify({'companies': companies, 'sender': sender, 'count': len(companies)})
+    except Exception as e:
+        return jsonify({'error': f'Excelの読み込みに失敗しました: {str(e)}'}), 400
 
 @app.route('/run', methods=['POST'])
 @auth.login_required
@@ -99,13 +101,16 @@ async def execute(session_id, mode):
         ws = wb['協力会社リスト']
         sender = {
             'name': ws['B2'].value or '',
-            'company': ws['B3'].value or '',
-            'email': ws['B4'].value or '',
-            'phone': ws['B5'].value or '',
-            'message': ws['B6'].value or '',
+            'name_kana': ws['B3'].value or '',
+            'company': ws['B4'].value or '',
+            'company_kana': ws['B5'].value or '',
+            'email': ws['B6'].value or '',
+            'phone': ws['B7'].value or '',
+            'inquiry_type': ws['B8'].value or '協力会社として取引のご案内',
+            'message': ws['B9'].value or '',
         }
 
-        df = pd.read_excel('uploads/companies.xlsx', sheet_name='協力会社リスト', header=8)
+        df = pd.read_excel('uploads/companies.xlsx', sheet_name='協力会社リスト', header=11)
         df.columns = ['No', '会社名', 'URL']
         df = df.dropna(subset=['会社名', 'URL'])
         companies = df.to_dict(orient='records')
@@ -132,57 +137,77 @@ async def execute(session_id, mode):
 
 def save_result(session_id, results):
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Border, Side
+    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 
     wb = Workbook()
     thin = Side(style='thin', color='AAAAAA')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
+    # 全件結果シート
     ws1 = wb.active
     ws1.title = '全件結果'
-    headers = ['No.', '会社名', 'ステータス', '失敗理由', '手動対応要否', '送信フォームURL', '実行日時']
+    headers = ['No.', '会社名', 'ステータス', '失敗・未入力の理由', '入力できなかった項目', '手動対応要否', '送信フォームURL', '実行日時']
     for col, h in enumerate(headers, 1):
         cell = ws1.cell(row=1, column=col, value=h)
         cell.font = Font(bold=True, color='FFFFFF')
         cell.fill = PatternFill('solid', start_color='1F4E79')
         cell.border = border
+        cell.alignment = Alignment(horizontal='center')
 
-    status_colors = {'✅ 送信完了': 'E2EFDA', '❌ 失敗': 'FFE0E0', '⚠️ スキップ': 'FFF2CC'}
+    status_colors = {'送信完了': 'E2EFDA', '送信完了（テスト）': 'E2EFDA', '部分送信': 'DDEBF7', '失敗': 'FFE0E0', 'スキップ': 'FFF2CC'}
     for i, r in enumerate(results, 1):
-        row = [i, r['company'], r['status'], r.get('reason', '-'),
-               '要手動対応' if r['status'] != '✅ 送信完了' else '-',
-               r.get('form_url', '-'), r.get('timestamp', '-')]
-        color = status_colors.get(r['status'], 'FFFFFF')
+        status = r['status']
+        color = 'FFFFFF'
+        for k, v in status_colors.items():
+            if k in status:
+                color = v
+                break
+        manual = '-'
+        if '失敗' in status or 'スキップ' in status:
+            manual = '要手動対応'
+        elif '部分' in status:
+            manual = '要確認'
+
+        row = [
+            i,
+            r['company'],
+            status,
+            r.get('reason', '-'),
+            r.get('missing_fields', '-'),
+            manual,
+            r.get('form_url', '-'),
+            r.get('timestamp', '-')
+        ]
         for col, val in enumerate(row, 1):
             cell = ws1.cell(row=i+1, column=col, value=val)
             cell.fill = PatternFill('solid', start_color=color)
             cell.border = border
 
+    for col, w in zip('ABCDEFGH', [6, 25, 18, 35, 35, 14, 40, 20]):
+        ws1.column_dimensions[col].width = w
+
+    # 手動対応リストシート
     ws2 = wb.create_sheet('手動対応リスト')
-    h2 = ['No.', '会社名', 'トップページURL', '失敗理由', '対応済み？']
+    h2 = ['No.', '会社名', 'トップページURL', 'ステータス', '理由・未入力項目', '対応済み？']
     for col, h in enumerate(h2, 1):
         cell = ws2.cell(row=1, column=col, value=h)
         cell.font = Font(bold=True, color='FFFFFF')
         cell.fill = PatternFill('solid', start_color='843C0C')
         cell.border = border
 
-    manual = [r for r in results if r['status'] != '✅ 送信完了']
-    for i, r in enumerate(manual, 1):
-        row = [i, r['company'], r.get('top_url', '-'), r.get('reason', '-'), '□']
+    manual_list = [r for r in results if '送信完了' not in r['status'] or '部分' in r['status']]
+    for i, r in enumerate(manual_list, 1):
+        reason = r.get('reason', '-')
+        if r.get('missing_fields') and r.get('missing_fields') != '-':
+            reason = f"{reason}／未入力: {r.get('missing_fields')}"
+        row = [i, r['company'], r.get('top_url', '-'), r['status'], reason, '□']
         for col, val in enumerate(row, 1):
             cell = ws2.cell(row=i+1, column=col, value=val)
             cell.fill = PatternFill('solid', start_color='FFF2CC')
             cell.border = border
 
-    for ws in [ws1, ws2]:
-        ws.column_dimensions['A'].width = 6
-        ws.column_dimensions['B'].width = 25
-        ws.column_dimensions['C'].width = 20
-        ws.column_dimensions['D'].width = 30
-        ws.column_dimensions['E'].width = 16
-        if ws == ws1:
-            ws.column_dimensions['F'].width = 40
-            ws.column_dimensions['G'].width = 20
+    for col, w in zip('ABCDEF', [6, 25, 40, 18, 45, 12]):
+        ws2.column_dimensions[col].width = w
 
     wb.save(f'outputs/result_{session_id}.xlsx')
 
