@@ -31,7 +31,7 @@ FILL_FORM_PROMPT = """
 送信者情報:
 {sender_json}
 
-問い合わせ種別ヒント（Excelで指定された内容）:
+問い合わせ種別ヒント:
 {inquiry_type}
 
 フォームHTML:
@@ -52,17 +52,23 @@ FILL_FORM_PROMPT = """
   ],
   "selects": {{
     "selectのnameまたはid": "選択するoption値またはラベル"
-  }}
+  }},
+  "missing_fields": [
+    {{
+      "field_name": "入力できなかったフィールド名",
+      "reason": "入力できなかった理由"
+    }}
+  ]
 }}
 
 チェックボックスの判断基準：
 - 「個人情報」「同意」「プライバシー」「利用規約」→ 必ずtrue
 - 問い合わせ種別は「問い合わせ種別ヒント」に近いものをtrue
 - 「営業」「勧誘」「広告」などはfalse
-- 複数選択可の場合は該当するものすべてtrue
 
-フリガナ・カナ・よみがな フィールドは送信者名をカタカナに変換して入力。
-会社名カナも同様にカタカナで入力。
+missing_fieldsには、選択肢が不明・特殊すぎて入力できなかった項目を記録してください。
+フリガナ・カナ・よみがなフィールドは送信者名カナを使って入力してください。
+会社名カナも同様にカタカナで入力してください。
 """
 
 
@@ -89,6 +95,7 @@ class FormSender:
             'top_url': top_url,
             'status': '',
             'reason': '',
+            'missing_fields': '-',
             'form_url': '',
             'timestamp': datetime.now().strftime('%Y/%m/%d %H:%M'),
         }
@@ -136,6 +143,7 @@ class FormSender:
                 await page.close()
                 return result
 
+            # Step4: AIでフォーム入力値を判定
             form_html = await page.inner_html('body')
             prompt = FILL_FORM_PROMPT.format(
                 sender_json=json.dumps(sender, ensure_ascii=False),
@@ -145,6 +153,11 @@ class FormSender:
             fill_data_str = self._call_claude(prompt)
             fill_data_str = self._extract_json(fill_data_str)
             fill_data = json.loads(fill_data_str)
+
+            # 入力できなかった項目を記録
+            missing = fill_data.get('missing_fields', [])
+            if missing:
+                result['missing_fields'] = '、'.join([f"{m['field_name']}（{m['reason']}）" for m in missing])
 
             # テキストフィールド入力
             for key, value in fill_data.get('text_fields', {}).items():
@@ -183,14 +196,23 @@ class FormSender:
                 except Exception:
                     pass
 
+            # 送信
             if self.test_mode:
-                result['status'] = '送信完了（テスト）'
-                result['reason'] = 'テストモードのため実際の送信はしていません'
+                if missing:
+                    result['status'] = '部分送信（テスト）'
+                    result['reason'] = '一部入力できない項目があります'
+                else:
+                    result['status'] = '送信完了（テスト）'
+                    result['reason'] = 'テストモードのため実際の送信はしていません'
             else:
                 submit = page.locator('button[type="submit"], input[type="submit"]').first
                 await submit.click()
                 await page.wait_for_timeout(2000)
-                result['status'] = '送信完了'
+                if missing:
+                    result['status'] = '部分送信'
+                    result['reason'] = '一部入力できない項目があります'
+                else:
+                    result['status'] = '送信完了'
 
             await page.close()
 
