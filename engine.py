@@ -1,8 +1,10 @@
 import os
 import json
 from datetime import datetime
-from playwright.async_api import async_playwright
 import anthropic
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 
 FIND_FORM_PROMPT = """
 あなたはWebサイトのHTML解析の専門家です。
@@ -12,21 +14,22 @@ FIND_FORM_PROMPT = """
 - 「お問い合わせ」「Contact」「問合せ」「ご相談」「資料請求」
 - 「協力会社の方へ」「お取引先の方」などの専用ページ
 
+また、ページ内に営業禁止・自動送信禁止の記載がないかも確認してください。
+
 レスポンスは必ずJSON形式のみで返してください：
 {
   "form_url": "フォームページのURL（見つからない場合はnull）",
-  "is_partner_form": true,
   "blocked": false,
   "blocked_reason": ""
 }
 
+ベースURL: {base_url}
 HTML:
 """
 
 FILL_FORM_PROMPT = """
 あなたはWebフォームの入力専門家です。
-以下のフォームHTMLと送信者情報をもとに、各フィールドへの入力値と
-チェックボックスの選択を決定してください。
+以下のフォームHTMLと送信者情報をもとに、送信に必要な情報を分析してください。
 
 送信者情報:
 {sender_json}
@@ -39,55 +42,47 @@ FILL_FORM_PROMPT = """
 
 以下のJSON形式のみで返してください。説明文は不要です：
 {{
-  "text_fields": {{
-    "フィールドのnameまたはid": "入力値"
-  }},
-  "checkboxes": [
-    {{
-      "name": "チェックボックスのnameまたはid",
-      "value": "valueの値",
-      "should_check": true,
-      "reason": "チェックする理由"
-    }}
-  ],
-  "selects": {{
-    "selectのnameまたはid": "選択するoption値またはラベル"
+  "action": "フォームのaction URL（なければnull）",
+  "method": "post または get",
+  "fields": {{
+    "フィールドのname属性": "入力値"
   }},
   "missing_fields": [
     {{
       "field_name": "入力できなかったフィールド名",
       "reason": "入力できなかった理由"
     }}
-  ]
+  ],
+  "has_captcha": false,
+  "has_js_required": false,
+  "notes": "特記事項があれば"
 }}
 
 チェックボックスの判断基準：
-- 「個人情報」「同意」「プライバシー」「利用規約」→ 必ずtrue
-- 問い合わせ種別は「問い合わせ種別ヒント」に近いものをtrue
-- 「営業」「勧誘」「広告」などはfalse
+- 「個人情報」「同意」「プライバシー」「利用規約」→ チェックありの値をfieldsに含める
+- 問い合わせ種別は「問い合わせ種別ヒント」に近いものを選択
+- 「営業」「勧誘」はfalseまたは選択しない
 
-missing_fieldsには、選択肢が不明・特殊すぎて入力できなかった項目を記録してください。
-フリガナ・カナ・よみがなフィールドは送信者名カナを使って入力してください。
-会社名カナも同様にカタカナで入力してください。
+フリガナ・カナ・よみがな フィールドは送信者名カナを使って入力。
+会社名カナも同様にカタカナで入力。
+missing_fieldsには選択肢が特殊すぎて判断できなかった項目を記録。
 """
 
 
 class FormSender:
     def __init__(self, test_mode=True):
         self.test_mode = test_mode
-        self.playwright = None
-        self.browser = None
         self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
 
     async def init(self):
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=True)
+        pass  # requestsは初期化不要
 
     async def close(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+        self.session.close()
 
     async def process(self, company_name, top_url, sender):
         result = {
@@ -100,122 +95,114 @@ class FormSender:
             'timestamp': datetime.now().strftime('%Y/%m/%d %H:%M'),
         }
         try:
-            page = await self.browser.new_page()
-            await page.goto(top_url, timeout=15000)
-            html = await page.content()
+            # Step1: トップページ取得
+            resp = self.session.get(top_url, timeout=15, allow_redirects=True)
+            resp.encoding = resp.apparent_encoding
+            html = resp.text
 
-            # Step1: フォームリンクをAIで探す
-            analysis = self._call_claude(FIND_FORM_PROMPT + html[:8000])
+            # Step2: フォームリンクをAIで探す
+            prompt = FIND_FORM_PROMPT.replace('{base_url}', top_url) + html[:8000]
+            analysis = self._call_claude(prompt)
             analysis = self._extract_json(analysis)
             data = json.loads(analysis)
 
             if data.get('blocked'):
                 result['status'] = 'スキップ'
                 result['reason'] = data.get('blocked_reason', '営業禁止の記載あり')
-                await page.close()
                 return result
 
             form_url = data.get('form_url')
             if not form_url:
                 result['status'] = '失敗'
                 result['reason'] = 'フォームリンクが見つかりませんでした'
-                await page.close()
                 return result
 
-            if form_url.startswith('/'):
-                from urllib.parse import urlparse
-                parsed = urlparse(top_url)
-                form_url = f"{parsed.scheme}://{parsed.netloc}{form_url}"
-
+            # 相対URLを絶対URLに変換
+            form_url = urljoin(top_url, form_url)
             result['form_url'] = form_url
-            await page.goto(form_url, timeout=15000)
 
-            content = await page.content()
-            if 'recaptcha' in content.lower() or 'hcaptcha' in content.lower():
+            # Step3: フォームページ取得
+            resp2 = self.session.get(form_url, timeout=15, allow_redirects=True)
+            resp2.encoding = resp2.apparent_encoding
+            form_html = resp2.text
+
+            # CAPTCHAチェック
+            if 'recaptcha' in form_html.lower() or 'hcaptcha' in form_html.lower():
                 result['status'] = '失敗'
                 result['reason'] = 'CAPTCHA検知'
-                await page.close()
                 return result
 
+            # PDFチェック
             if form_url.lower().endswith('.pdf'):
                 result['status'] = '失敗'
                 result['reason'] = 'PDFフォーム（対応不可）'
-                await page.close()
                 return result
 
             # Step4: AIでフォーム入力値を判定
-            form_html = await page.inner_html('body')
-            prompt = FILL_FORM_PROMPT.format(
+            prompt2 = FILL_FORM_PROMPT.format(
                 sender_json=json.dumps(sender, ensure_ascii=False),
                 inquiry_type=sender.get('inquiry_type', '協力会社として取引のご案内'),
                 form_html=form_html[:6000]
             )
-            fill_data_str = self._call_claude(prompt)
-            fill_data_str = self._extract_json(fill_data_str)
-            fill_data = json.loads(fill_data_str)
+            fill_str = self._call_claude(prompt2)
+            fill_str = self._extract_json(fill_str)
+            fill_data = json.loads(fill_str)
+
+            # JavaScriptが必須の場合は失敗
+            if fill_data.get('has_captcha'):
+                result['status'] = '失敗'
+                result['reason'] = 'CAPTCHA検知（フォーム内）'
+                return result
+
+            if fill_data.get('has_js_required'):
+                result['status'] = '失敗'
+                result['reason'] = 'JavaScript必須フォーム（対応不可）'
+                return result
 
             # 入力できなかった項目を記録
             missing = fill_data.get('missing_fields', [])
             if missing:
-                result['missing_fields'] = '、'.join([f"{m['field_name']}（{m['reason']}）" for m in missing])
+                result['missing_fields'] = '、'.join(
+                    [f"{m['field_name']}（{m['reason']}）" for m in missing]
+                )
 
-            # テキストフィールド入力
-            for key, value in fill_data.get('text_fields', {}).items():
-                try:
-                    locator = page.locator(f'[name="{key}"], [id="{key}"]').first
-                    await locator.fill(str(value))
-                except Exception:
-                    pass
+            # Step5: フォーム送信
+            fields = fill_data.get('fields', {})
+            action = fill_data.get('action') or form_url
+            action = urljoin(form_url, action)
+            method = (fill_data.get('method') or 'post').lower()
 
-            # チェックボックス操作
-            for cb in fill_data.get('checkboxes', []):
-                try:
-                    name = cb.get('name', '')
-                    value = cb.get('value', '')
-                    should_check = cb.get('should_check', False)
-                    if value:
-                        locator = page.locator(f'input[type="checkbox"][name="{name}"][value="{value}"]').first
-                    else:
-                        locator = page.locator(f'input[type="checkbox"][name="{name}"], input[type="checkbox"][id="{name}"]').first
-                    is_checked = await locator.is_checked()
-                    if should_check and not is_checked:
-                        await locator.check()
-                    elif not should_check and is_checked:
-                        await locator.uncheck()
-                except Exception:
-                    pass
-
-            # セレクトボックス操作
-            for key, value in fill_data.get('selects', {}).items():
-                try:
-                    locator = page.locator(f'select[name="{key}"], select[id="{key}"]').first
-                    try:
-                        await locator.select_option(value=str(value))
-                    except Exception:
-                        await locator.select_option(label=str(value))
-                except Exception:
-                    pass
-
-            # 送信
             if self.test_mode:
+                # テストモード：送信せずに入力内容をログ
                 if missing:
                     result['status'] = '部分送信（テスト）'
                     result['reason'] = '一部入力できない項目があります'
                 else:
                     result['status'] = '送信完了（テスト）'
-                    result['reason'] = 'テストモードのため実際の送信はしていません'
+                    result['reason'] = f'入力項目数: {len(fields)}件 ／ テストのため未送信'
             else:
-                submit = page.locator('button[type="submit"], input[type="submit"]').first
-                await submit.click()
-                await page.wait_for_timeout(2000)
-                if missing:
-                    result['status'] = '部分送信'
-                    result['reason'] = '一部入力できない項目があります'
+                # 本番モード：実際に送信
+                if method == 'get':
+                    send_resp = self.session.get(action, params=fields, timeout=15)
                 else:
-                    result['status'] = '送信完了'
+                    send_resp = self.session.post(action, data=fields, timeout=15)
 
-            await page.close()
+                if send_resp.status_code in [200, 201, 302]:
+                    if missing:
+                        result['status'] = '部分送信'
+                        result['reason'] = '一部入力できない項目があります'
+                    else:
+                        result['status'] = '送信完了'
+                else:
+                    result['status'] = '失敗'
+                    result['reason'] = f'送信エラー（HTTPステータス: {send_resp.status_code}）'
 
+        except requests.exceptions.Timeout:
+            result['status'] = '失敗'
+            result['reason'] = 'タイムアウト（サイトへの接続に時間がかかりすぎ）'
+        except requests.exceptions.ConnectionError:
+            result['status'] = '失敗'
+            result['reason'] = 'サイトに接続できませんでした'
         except Exception as e:
             result['status'] = '失敗'
             result['reason'] = f'エラー: {str(e)[:100]}'
