@@ -73,11 +73,12 @@ def upload():
 def run():
     data = request.json
     mode = data.get('mode', 'test')  # test or production
+    document_url = data.get('document_url', '')  # 画面から受け取る資料URL
     session_id = datetime.now().strftime('%Y%m%d%H%M%S')
     progress_store[session_id] = {'status': 'running', 'results': [], 'total': 0, 'done': 0}
 
     def run_async():
-        asyncio.run(execute(session_id, mode))
+        asyncio.run(execute(session_id, mode, document_url))
 
     thread = threading.Thread(target=run_async)
     thread.start()
@@ -96,24 +97,21 @@ def download(session_id):
         return send_file(path, as_attachment=True, download_name='送信結果.xlsx')
     return jsonify({'error': 'ファイルが見つかりません'}), 404
 
-async def execute(session_id, mode):
+async def execute(session_id, mode, document_url=''):
     try:
         wb = load_workbook('uploads/companies.xlsx')
-        ws = wb['協力会社リスト']
+        ws = wb.active  # アクティブシートを使用
         sender = {
-            'name': ws['B2'].value or '',
-            'name_kana': ws['B3'].value or '',
-            'company': ws['B4'].value or '',
-            'company_kana': ws['B5'].value or '',
-            'email': ws['B6'].value or '',
-            'phone': ws['B7'].value or '',
-            'inquiry_type': ws['B8'].value or '協力会社として取引のご案内',
-            'message': ws['B9'].value or '',
+            'name': '',
+            'company': '',
+            'email': '',
+            'phone': '',
+            'message': '',
         }
-        document_url = ws['B10'].value or ''  # B10から資料URLを取得
 
-        df = pd.read_excel('uploads/companies.xlsx', sheet_name='協力会社リスト', header=11)
-        df.columns = ['No', '会社名', 'URL']
+        # document_urlが空の場合はGAS_URLから取得しない（追跡なし）
+        df = pd.read_excel('uploads/companies.xlsx', header=0)
+        df.columns = ['会社名', 'URL']
         df = df.dropna(subset=['会社名', 'URL'])
         companies = df.to_dict(orient='records')
 
@@ -208,4 +206,4 @@ def save_result(session_id, results):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=port)
