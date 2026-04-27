@@ -4,12 +4,25 @@ import asyncio
 import threading
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file
+from flask_httpauth import HTTPBasicAuth
+from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from engine import FormSender
 
 app = Flask(__name__)
+auth = HTTPBasicAuth()
+
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "password123")
+users = {AUTH_USERNAME: generate_password_hash(AUTH_PASSWORD)}
+
+@auth.verify_password
+def verify_password(username, password):
+    if username in users and check_password_hash(users.get(username), password):
+        return username
+
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs('uploads', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
@@ -18,10 +31,12 @@ os.makedirs('outputs', exist_ok=True)
 progress_store = {}
 
 @app.route('/')
+@auth.login_required
 def index():
     return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
+@auth.login_required
 def upload():
     file = request.files.get('file')
     if not file:
@@ -29,25 +44,32 @@ def upload():
     path = os.path.join(app.config['UPLOAD_FOLDER'], 'companies.xlsx')
     file.save(path)
 
-    # プレビュー用にデータ読み込み
-    df = pd.read_excel(path, sheet_name='協力会社リスト', header=8)
-    df.columns = ['No', '会社名', 'URL']
-    df = df.dropna(subset=['会社名', 'URL'])
-    companies = df[['会社名', 'URL']].to_dict(orient='records')
+    try:
+        wb = load_workbook(path)
+        ws = wb['協力会社リスト']
+        sender = {
+            '送信者名': ws['B2'].value,
+            '送信者名カナ': ws['B3'].value,
+            '送信者会社名': ws['B4'].value,
+            '送信者会社名カナ': ws['B5'].value,
+            'メール': ws['B6'].value,
+            '電話': ws['B7'].value,
+            '問い合わせ種別': ws['B8'].value,
+            '本文': ws['B9'].value,
+            '資料URL': ws['B10'].value,  # B10に資料URLを追加
+        }
 
-    # 送信者情報読み込み
-    wb = load_workbook(path)
-    ws = wb['協力会社リスト']
-    sender = {
-        '送信者名': ws['B2'].value,
-        '送信者会社名': ws['B3'].value,
-        'メール': ws['B4'].value,
-        '電話': ws['B5'].value,
-        '本文': ws['B6'].value,
-    }
-    return jsonify({'companies': companies, 'sender': sender, 'count': len(companies)})
+        df = pd.read_excel(path, sheet_name='協力会社リスト', header=11)
+        df.columns = ['No', '会社名', 'URL']
+        df = df.dropna(subset=['会社名', 'URL'])
+        companies = df[['会社名', 'URL']].to_dict(orient='records')
+
+        return jsonify({'companies': companies, 'sender': sender, 'count': len(companies)})
+    except Exception as e:
+        return jsonify({'error': f'Excelの読み込みに失敗しました: {str(e)}'}), 400
 
 @app.route('/run', methods=['POST'])
+@auth.login_required
 def run():
     data = request.json
     mode = data.get('mode', 'test')  # test or production
@@ -62,10 +84,12 @@ def run():
     return jsonify({'session_id': session_id})
 
 @app.route('/progress/<session_id>')
+@auth.login_required
 def progress(session_id):
     return jsonify(progress_store.get(session_id, {'status': 'not_found'}))
 
 @app.route('/download/<session_id>')
+@auth.login_required
 def download(session_id):
     path = f'outputs/result_{session_id}.xlsx'
     if os.path.exists(path):
@@ -78,14 +102,17 @@ async def execute(session_id, mode):
         ws = wb['協力会社リスト']
         sender = {
             'name': ws['B2'].value or '',
-            'company': ws['B3'].value or '',
-            'email': ws['B4'].value or '',
-            'phone': ws['B5'].value or '',
-            'message': ws['B6'].value or '',
+            'name_kana': ws['B3'].value or '',
+            'company': ws['B4'].value or '',
+            'company_kana': ws['B5'].value or '',
+            'email': ws['B6'].value or '',
+            'phone': ws['B7'].value or '',
+            'inquiry_type': ws['B8'].value or '協力会社として取引のご案内',
+            'message': ws['B9'].value or '',
         }
-        document_url = ws['B7'].value or ''  # B7に資料URLを追加
+        document_url = ws['B10'].value or ''  # B10から資料URLを取得
 
-        df = pd.read_excel('uploads/companies.xlsx', sheet_name='協力会社リスト', header=8)
+        df = pd.read_excel('uploads/companies.xlsx', sheet_name='協力会社リスト', header=11)
         df.columns = ['No', '会社名', 'URL']
         df = df.dropna(subset=['会社名', 'URL'])
         companies = df.to_dict(orient='records')
@@ -97,6 +124,7 @@ async def execute(session_id, mode):
         await sender_obj.init()
 
         for i, company in enumerate(companies):
+            # 会社名と資料URLを渡して追跡URLを自動生成
             result = await sender_obj.process(company['会社名'], company['URL'], sender, document_url)
             results.append(result)
             progress_store[session_id]['done'] = i + 1
@@ -121,18 +149,26 @@ def save_result(session_id, results):
     # 全件結果シート
     ws1 = wb.active
     ws1.title = '全件結果'
-    headers = ['No.', '会社名', 'ステータス', '失敗理由', '手動対応要否', '送信フォームURL', '実行日時']
+    headers = ['No.', '会社名', 'ステータス', '失敗理由', '追跡URL', '手動対応要否', '送信フォームURL', '実行日時']
     for col, h in enumerate(headers, 1):
         cell = ws1.cell(row=1, column=col, value=h)
         cell.font = Font(bold=True, color='FFFFFF')
         cell.fill = PatternFill('solid', start_color='1F4E79')
         cell.border = border
+        cell.alignment = Alignment(horizontal='center')
 
     status_colors = {'✅ 送信完了': 'E2EFDA', '❌ 失敗': 'FFE0E0', '⚠️ スキップ': 'FFF2CC'}
     for i, r in enumerate(results, 1):
-        row = [i, r['company'], r['status'], r.get('reason', '-'),
-               '要手動対応' if r['status'] != '✅ 送信完了' else '-',
-               r.get('form_url', '-'), r.get('timestamp', '-')]
+        row = [
+            i,
+            r['company'],
+            r['status'],
+            r.get('reason', '-'),
+            r.get('tracking_url', '-'),  # 追跡URLを結果に追加
+            '要手動対応' if r['status'] != '✅ 送信完了' else '-',
+            r.get('form_url', '-'),
+            r.get('timestamp', '-')
+        ]
         color = status_colors.get(r['status'], 'FFFFFF')
         for col, val in enumerate(row, 1):
             cell = ws1.cell(row=i+1, column=col, value=val)
@@ -156,17 +192,20 @@ def save_result(session_id, results):
             cell.fill = PatternFill('solid', start_color='FFF2CC')
             cell.border = border
 
+    # 列幅設定
     for ws in [ws1, ws2]:
         ws.column_dimensions['A'].width = 6
         ws.column_dimensions['B'].width = 25
         ws.column_dimensions['C'].width = 20
         ws.column_dimensions['D'].width = 30
-        ws.column_dimensions['E'].width = 16
-        if ws == ws1:
-            ws.column_dimensions['F'].width = 40
-            ws.column_dimensions['G'].width = 20
+        ws.column_dimensions['E'].width = 40
+    ws1.column_dimensions['F'].width = 16
+    ws1.column_dimensions['G'].width = 40
+    ws1.column_dimensions['H'].width = 20
+    ws2.column_dimensions['E'].width = 16
 
     wb.save(f'outputs/result_{session_id}.xlsx')
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
