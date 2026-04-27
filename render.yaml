@@ -3,7 +3,7 @@ services:
     name: form-sender
     env: python
     buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
-    startCommand: gunicorn -w 1 -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT
+    startCommand: python -c "import os; os.environ['FLASK_ENV']='production'; exec(open('app.py').read())"
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
