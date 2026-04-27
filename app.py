@@ -45,26 +45,19 @@ def upload():
     file.save(path)
 
     try:
-        wb = load_workbook(path)
-        ws = wb['協力会社リスト']
-        sender = {
-            '送信者名': ws['B2'].value,
-            '送信者名カナ': ws['B3'].value,
-            '送信者会社名': ws['B4'].value,
-            '送信者会社名カナ': ws['B5'].value,
-            'メール': ws['B6'].value,
-            '電話': ws['B7'].value,
-            '問い合わせ種別': ws['B8'].value,
-            '本文': ws['B9'].value,
-            '資料URL': ws['B10'].value,  # B10に資料URLを追加
-        }
+        # シート名に依存せず最初のシートを使用
+        df = pd.read_excel(path, header=0)
+        df.columns = [str(c).strip() for c in df.columns]
 
-        df = pd.read_excel(path, sheet_name='協力会社リスト', header=11)
-        df.columns = ['No', '会社名', 'URL']
+        # A列・B列を会社名・URLとして読み込む
+        df = df.iloc[:, :2]
+        df.columns = ['会社名', 'URL']
         df = df.dropna(subset=['会社名', 'URL'])
+        df = df[df['会社名'].astype(str).str.strip() != '']
+        df = df[df['URL'].astype(str).str.startswith('http')]
         companies = df[['会社名', 'URL']].to_dict(orient='records')
 
-        return jsonify({'companies': companies, 'sender': sender, 'count': len(companies)})
+        return jsonify({'companies': companies, 'sender': {}, 'count': len(companies)})
     except Exception as e:
         return jsonify({'error': f'Excelの読み込みに失敗しました: {str(e)}'}), 400
 
@@ -99,8 +92,14 @@ def download(session_id):
 
 async def execute(session_id, mode, document_url=''):
     try:
-        wb = load_workbook('uploads/companies.xlsx')
-        ws = wb.active  # アクティブシートを使用
+        # シート名に依存せず最初のシートからA列・B列を読み込む
+        df = pd.read_excel('uploads/companies.xlsx', header=0)
+        df = df.iloc[:, :2]
+        df.columns = ['会社名', 'URL']
+        df = df.dropna(subset=['会社名', 'URL'])
+        df = df[df['URL'].astype(str).str.startswith('http')]
+        companies = df.to_dict(orient='records')
+
         sender = {
             'name': '',
             'company': '',
@@ -108,12 +107,6 @@ async def execute(session_id, mode, document_url=''):
             'phone': '',
             'message': '',
         }
-
-        # document_urlが空の場合はGAS_URLから取得しない（追跡なし）
-        df = pd.read_excel('uploads/companies.xlsx', header=0)
-        df.columns = ['会社名', 'URL']
-        df = df.dropna(subset=['会社名', 'URL'])
-        companies = df.to_dict(orient='records')
 
         progress_store[session_id]['total'] = len(companies)
         results = []
