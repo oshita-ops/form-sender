@@ -44,6 +44,13 @@
     .log-box .skip { color: #ffd43b; }
     .download-btn { display: none; width: 100%; padding: 14px; background: #375623; color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; margin-top: 16px; }
     .warning-box { background: #fff8e6; border: 1px solid #ffc107; border-radius: 8px; padding: 14px 16px; font-size: 13px; color: #856404; margin-bottom: 16px; }
+    .url-input-wrap { margin-top: 20px; }
+    .url-input-wrap label { font-size: 13px; font-weight: bold; color: #1F4E79; display: block; margin-bottom: 6px; }
+    .url-input-wrap input { width: 100%; padding: 10px 14px; border: 2px solid #aac4e0; border-radius: 8px; font-size: 13px; transition: border-color 0.2s; }
+    .url-input-wrap input:focus { outline: none; border-color: #1F4E79; }
+    .url-input-wrap .hint { font-size: 11px; color: #888; margin-top: 4px; }
+    .url-badge { display: inline-block; background: #e8f5e9; color: #2e7d32; border-radius: 4px; padding: 2px 8px; font-size: 11px; margin-left: 8px; }
+    .url-badge.empty { background: #fff3e0; color: #e65100; }
   </style>
 </head>
 <body>
@@ -57,15 +64,28 @@
     <div class="upload-area" onclick="document.getElementById('fileInput').click()">
       <input type="file" id="fileInput" accept=".xlsx" onchange="uploadFile(this)">
       <div style="font-size:40px">📂</div>
-      <p>クリックしてExcelファイルを選択<br><small>（協力会社リスト.xlsx）</small></p>
+      <p>クリックしてExcelファイルを選択<br><small>（A列：企業名、B列：WebサイトURL）</small></p>
     </div>
     <div id="previewArea" style="display:none">
-      <div style="margin-top:16px;font-size:14px;font-weight:bold;color:#1F4E79">📋 送信者情報</div>
-      <div class="sender-info" id="senderInfo"></div>
-      <div style="margin-top:16px;font-size:14px;font-weight:bold;color:#1F4E79">🏢 協力会社リスト（<span id="companyCount">0</span>社）</div>
+      <div style="margin-top:16px;font-size:14px;font-weight:bold;color:#1F4E79">🏢 企業リスト（<span id="companyCount">0</span>社）</div>
       <div class="preview-box">
         <table><thead><tr><th>会社名</th><th>URL</th></tr></thead><tbody id="previewBody"></tbody></table>
       </div>
+    </div>
+
+    <!-- 資料URL入力欄 -->
+    <div class="url-input-wrap">
+      <label>
+        📎 追跡する資料のURL
+        <span class="url-badge empty" id="urlBadge">未入力</span>
+      </label>
+      <input
+        type="url"
+        id="documentUrl"
+        placeholder="https://drive.google.com/file/d/xxxxxx（GoogleドライブのURL）"
+        oninput="onDocumentUrlChange(this.value)"
+      />
+      <div class="hint">※ 入力すると相手が資料を開いた際にSlackへ通知が届きます。空白のままでも送信できます。</div>
     </div>
   </div>
 
@@ -97,6 +117,17 @@
 <script>
 let currentMode = 'test', currentSessionId = null, progressInterval = null;
 
+function onDocumentUrlChange(val) {
+  const badge = document.getElementById('urlBadge');
+  if (val.trim()) {
+    badge.textContent = '設定済み ✓';
+    badge.className = 'url-badge';
+  } else {
+    badge.textContent = '未入力';
+    badge.className = 'url-badge empty';
+  }
+}
+
 function selectMode(mode) {
   currentMode = mode;
   document.getElementById('testBtn').classList.toggle('active', mode === 'test');
@@ -114,23 +145,18 @@ async function uploadFile(input) {
   const res = await fetch('/upload', { method: 'POST', body: form });
   const data = await res.json();
   if (data.error) { alert(data.error); return; }
-  const s = data.sender;
-  document.getElementById('senderInfo').innerHTML = `
-    <div class="sender-item"><label>送信者名</label><span>${s['送信者名']||'-'}</span></div>
-    <div class="sender-item"><label>会社名</label><span>${s['送信者会社名']||'-'}</span></div>
-    <div class="sender-item"><label>メール</label><span>${s['メール']||'-'}</span></div>
-    <div class="sender-item"><label>電話</label><span>${s['電話']||'-'}</span></div>`;
+
   document.getElementById('companyCount').textContent = data.count;
   const tbody = document.getElementById('previewBody');
   tbody.innerHTML = '';
-  data.companies.slice(0,10).forEach(c => {
+  data.companies.slice(0, 10).forEach(c => {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${c['会社名']}</td><td><a href="${c['URL']}" target="_blank">${c['URL']}</a></td>`;
     tbody.appendChild(tr);
   });
   if (data.count > 10) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td colspan="2" style="color:#999;text-align:center">... 他${data.count-10}社</td>`;
+    tr.innerHTML = `<td colspan="2" style="color:#999;text-align:center">... 他${data.count - 10}社</td>`;
     tbody.appendChild(tr);
   }
   document.getElementById('previewArea').style.display = 'block';
@@ -139,10 +165,15 @@ async function uploadFile(input) {
 
 async function startRun() {
   if (currentMode === 'production' && !confirm('本番モードで実際に送信します。よろしいですか？')) return;
+  const documentUrl = document.getElementById('documentUrl').value.trim();
   document.getElementById('runBtn').disabled = true;
   document.getElementById('step3').style.display = 'block';
-  document.getElementById('step3').scrollIntoView({behavior:'smooth'});
-  const res = await fetch('/run', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:currentMode})});
+  document.getElementById('step3').scrollIntoView({ behavior: 'smooth' });
+  const res = await fetch('/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: currentMode, document_url: documentUrl })
+  });
   const data = await res.json();
   currentSessionId = data.session_id;
   progressInterval = setInterval(checkProgress, 1500);
@@ -151,14 +182,14 @@ async function startRun() {
 async function checkProgress() {
   const res = await fetch(`/progress/${currentSessionId}`);
   const data = await res.json();
-  const pct = data.total > 0 ? Math.round(data.done/data.total*100) : 0;
+  const pct = data.total > 0 ? Math.round(data.done / data.total * 100) : 0;
   document.getElementById('progressBar').style.width = pct + '%';
   document.getElementById('progressText').textContent = `${data.done} / ${data.total} 社処理済み（${pct}%）`;
   const logBox = document.getElementById('logBox');
   logBox.innerHTML = '';
-  (data.results||[]).slice(-20).reverse().forEach(r => {
+  (data.results || []).slice(-20).reverse().forEach(r => {
     const cls = r.status.includes('完了') ? 'ok' : r.status.includes('スキップ') ? 'skip' : 'err';
-    logBox.innerHTML += `<div class="${cls}">${r.status} | ${r.company} | ${r.reason||r.form_url||''}</div>`;
+    logBox.innerHTML += `<div class="${cls}">${r.status} | ${r.company} | ${r.reason || r.form_url || ''}</div>`;
   });
   if (data.status === 'done') {
     clearInterval(progressInterval);
@@ -170,6 +201,7 @@ async function checkProgress() {
     document.getElementById('progressText').textContent = `❌ エラー: ${data.error}`;
   }
 }
+
 function downloadResult() { window.location.href = `/download/${currentSessionId}`; }
 </script>
 </body>
