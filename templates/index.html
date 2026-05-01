@@ -51,6 +51,16 @@
     .url-input-wrap .hint { font-size: 11px; color: #888; margin-top: 4px; }
     .url-badge { display: inline-block; background: #e8f5e9; color: #2e7d32; border-radius: 4px; padding: 2px 8px; font-size: 11px; margin-left: 8px; }
     .url-badge.empty { background: #fff3e0; color: #e65100; }
+    .sender-form { margin-top: 24px; padding-top: 20px; border-top: 1px solid #eee; }
+    .sender-form h3 { font-size: 14px; color: #1F4E79; margin-bottom: 12px; }
+    .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 640px) { .field-grid { grid-template-columns: 1fr; } }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 12px; font-weight: bold; color: #444; }
+    .field input, .field textarea { width: 100%; padding: 10px 12px; border: 2px solid #aac4e0; border-radius: 8px; font-size: 13px; font-family: inherit; }
+    .field textarea { min-height: 120px; resize: vertical; }
+    .field input:focus, .field textarea:focus { outline: none; border-color: #1F4E79; }
+    .field-full { grid-column: 1 / -1; }
   </style>
 </head>
 <body>
@@ -85,7 +95,34 @@
         placeholder="https://drive.google.com/file/d/xxxxxx（GoogleドライブのURL）"
         oninput="onDocumentUrlChange(this.value)"
       />
-      <div class="hint">※ 入力すると相手が資料を開いた際にSlackへ通知が届きます。空白のままでも送信できます。</div>
+      <div class="hint">※ GAS_URL を設定し、本文に {TRACKING_URL} を含めるか資料URLのみ入力すると、企業別の追跡リンクを本文に差し込みます（GAS 未設定時は資料URLをそのまま使用）。</div>
+    </div>
+
+    <div class="sender-form">
+      <h3>送信者・お問い合わせ内容</h3>
+      <p style="font-size:12px;color:#666;margin-bottom:12px">フォームの各項目にマッピングされます。資料追跡を使う場合は本文に <code>{TRACKING_URL}</code> を含めてください（省略時は資料URL入力時に追跡リンク行を自動で追加します）。</p>
+      <div class="field-grid">
+        <div class="field">
+          <label for="senderName">担当者名</label>
+          <input type="text" id="senderName" placeholder="山田 太郎" autocomplete="name">
+        </div>
+        <div class="field">
+          <label for="senderCompany">会社名（自社）</label>
+          <input type="text" id="senderCompany" placeholder="株式会社サンプル" autocomplete="organization">
+        </div>
+        <div class="field">
+          <label for="senderEmail">メールアドレス</label>
+          <input type="email" id="senderEmail" placeholder="contact@example.com" autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="senderPhone">電話番号</label>
+          <input type="tel" id="senderPhone" placeholder="03-1234-5678" autocomplete="tel">
+        </div>
+        <div class="field field-full">
+          <label for="senderMessage">お問い合わせ本文</label>
+          <textarea id="senderMessage" placeholder="拝啓&#10;&#10;弊社のご案内資料はこちらです：&#10;{TRACKING_URL}&#10;&#10;ご確認のほどよろしくお願いいたします。"></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -163,8 +200,22 @@ async function uploadFile(input) {
   document.getElementById('step2').style.display = 'block';
 }
 
+function collectSender() {
+  return {
+    name: document.getElementById('senderName').value.trim(),
+    company: document.getElementById('senderCompany').value.trim(),
+    email: document.getElementById('senderEmail').value.trim(),
+    phone: document.getElementById('senderPhone').value.trim(),
+    message: document.getElementById('senderMessage').value.trim()
+  };
+}
+
 async function startRun() {
   if (currentMode === 'production' && !confirm('本番モードで実際に送信します。よろしいですか？')) return;
+  const sender = collectSender();
+  if (currentMode === 'production' && !sender.email) {
+    if (!confirm('メールアドレスが空です。多くの問い合わせフォームで必須のため失敗しやすくなります。このまま続行しますか？')) return;
+  }
   const documentUrl = document.getElementById('documentUrl').value.trim();
   document.getElementById('runBtn').disabled = true;
   document.getElementById('step3').style.display = 'block';
@@ -172,7 +223,7 @@ async function startRun() {
   const res = await fetch('/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode: currentMode, document_url: documentUrl })
+    body: JSON.stringify({ mode: currentMode, document_url: documentUrl, sender })
   });
   const data = await res.json();
   currentSessionId = data.session_id;

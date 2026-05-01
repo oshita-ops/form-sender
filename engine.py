@@ -1,4 +1,3 @@
-import re
 import json
 import os
 import requests
@@ -6,27 +5,64 @@ import anthropic
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
 # ============================================================
-# SalesOS GAS設定
-# デプロイしたGASのURLを入れてください
+# SalesOS GAS設定（デプロイした Web アプリの URL）
 # ============================================================
 GAS_URL = os.environ.get("GAS_URL", "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec")
 
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+
+def _gas_configured():
+    u = (os.environ.get("GAS_URL") or "").strip()
+    return bool(u) and "YOUR_SCRIPT_ID" not in u
+
+
 def generate_tracking_url(company_name, document_url):
-    """GASを呼び出して追跡URLを生成する"""
+    """GASを呼び出して追跡URLを生成する。未設定時は資料URLをそのまま返す。"""
+    if not _gas_configured():
+        return document_url
     try:
-        response = requests.get(GAS_URL, params={
-            "action": "generate",
-            "company": company_name,
-            "docUrl": document_url,
-        }, timeout=10)
+        response = requests.get(
+            os.environ.get("GAS_URL", GAS_URL),
+            params={
+                "action": "generate",
+                "company": company_name,
+                "docUrl": document_url,
+            },
+            timeout=10,
+        )
         data = response.json()
         return data.get("trackingUrl", document_url)
     except Exception as e:
         print(f"[追跡URL生成失敗] {company_name}: {e}")
-        return document_url  # 失敗した場合は元のURLをそのまま使う
+        return document_url
+
+
+def parse_json_from_model(text):
+    """Claude 応答から JSON オブジェクトを取り出す（``` フェンスや前後の説明文に耐性）。"""
+    if not text or not isinstance(text, str):
+        raise ValueError("empty response")
+    s = text.strip()
+    if "```" in s:
+        parts = s.split("```")
+        for block in parts:
+            block = block.strip()
+            if block.lower().startswith("json"):
+                block = block[4:].lstrip()
+            if block.startswith("{") or block.startswith("["):
+                s = block
+                break
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        start = s.find("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(s[start : end + 1])
+        raise
+
 
 FIND_FORM_PROMPT = """
 あなたはWebサイトのHTML解析の専門家です。
@@ -64,7 +100,6 @@ selectやtextareaも含めてください。
 例: {{"name": "山田太郎", "email": "test@example.com", "message": "お問い合わせ内容"}}
 """
 
-import os
 
 class FormSender:
     def __init__(self, test_mode=True):
@@ -72,6 +107,7 @@ class FormSender:
         self.playwright = None
         self.browser = None
         self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        self.model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
     async def init(self):
         self.playwright = await async_playwright().start()
@@ -83,111 +119,117 @@ class FormSender:
 
     async def process(self, company_name, top_url, sender, document_url=""):
         result = {
-            'company': company_name,
-            'top_url': top_url,
-            'status': '',
-            'reason': '',
-            'form_url': '',
-            'timestamp': datetime.now().strftime('%Y/%m/%d %H:%M'),
+            "company": company_name,
+            "top_url": top_url,
+            "status": "",
+            "reason": "",
+            "form_url": "",
+            "timestamp": datetime.now().strftime("%Y/%m/%d %H:%M"),
         }
+        sender_work = {
+            "name": str(sender.get("name", "") or "").strip(),
+            "company": str(sender.get("company", "") or "").strip(),
+            "email": str(sender.get("email", "") or "").strip(),
+            "phone": str(sender.get("phone", "") or "").strip(),
+            "message": str(sender.get("message", "") or "").strip(),
+        }
+
         try:
-            # 追跡URLを生成して本文に埋め込む
-            if document_url and "{TRACKING_URL}" in sender.get("message", ""):
-                tracking_url = generate_tracking_url(company_name, document_url)
-                sender = dict(sender)  # コピーして元データを変更しない
-                sender["message"] = sender["message"].replace("{TRACKING_URL}", tracking_url)
+            doc = (document_url or "").strip()
+            if doc:
+                tracking_url = generate_tracking_url(company_name, doc)
+                msg = sender_work["message"]
+                if "{TRACKING_URL}" in msg:
+                    sender_work["message"] = msg.replace("{TRACKING_URL}", tracking_url)
+                else:
+                    suffix = f"\nご資料（アクセス通知付き）: {tracking_url}"
+                    sender_work["message"] = (msg + suffix).strip() if msg else f"ご資料はこちらです: {tracking_url}"
                 result["tracking_url"] = tracking_url
-                print(f"[追跡URL生成] {company_name}: {tracking_url}")
 
             page = await self.browser.new_page()
             await page.goto(top_url, timeout=15000)
             html = await page.content()
 
-            # Step1: フォームリンクを探す
             analysis = self._call_claude(FIND_FORM_PROMPT + html[:8000])
-            data = json.loads(analysis)
+            data = parse_json_from_model(analysis)
 
-            if data.get('blocked'):
-                result['status'] = '⚠️ スキップ'
-                result['reason'] = f"送信禁止: {data.get('blocked_reason', '営業禁止の記載あり')}"
+            if data.get("blocked"):
+                result["status"] = "⚠️ スキップ"
+                result["reason"] = f"送信禁止: {data.get('blocked_reason', '営業禁止の記載あり')}"
                 await page.close()
                 return result
 
-            form_url = data.get('form_url')
+            form_url = data.get("form_url")
             if not form_url:
-                result['status'] = '❌ 失敗'
-                result['reason'] = 'フォームリンクが見つかりませんでした'
+                result["status"] = "❌ 失敗"
+                result["reason"] = "フォームリンクが見つかりませんでした"
                 await page.close()
                 return result
 
-            # 相対URLを絶対URLに変換
-            if form_url.startswith('/'):
+            if form_url.startswith("/"):
                 from urllib.parse import urlparse
+
                 parsed = urlparse(top_url)
                 form_url = f"{parsed.scheme}://{parsed.netloc}{form_url}"
 
-            result['form_url'] = form_url
+            result["form_url"] = form_url
             await page.goto(form_url, timeout=15000)
 
-            # Step2: CAPTCHAチェック
             content = await page.content()
-            if 'recaptcha' in content.lower() or 'hcaptcha' in content.lower():
-                result['status'] = '❌ 失敗'
-                result['reason'] = 'CAPTCHA検知'
+            if "recaptcha" in content.lower() or "hcaptcha" in content.lower():
+                result["status"] = "❌ 失敗"
+                result["reason"] = "CAPTCHA検知"
                 await page.close()
                 return result
 
-            # Step3: PDFチェック
-            if form_url.endswith('.pdf'):
-                result['status'] = '❌ 失敗'
-                result['reason'] = 'PDFフォーム（対応不可）'
+            if form_url.endswith(".pdf"):
+                result["status"] = "❌ 失敗"
+                result["reason"] = "PDFフォーム（対応不可）"
                 await page.close()
                 return result
 
-            # Step4: フォーム入力値をAIで判定
-            form_html = await page.inner_html('body')
+            form_html = await page.inner_html("body")
             prompt = FILL_FORM_PROMPT.format(
-                sender_json=json.dumps(sender, ensure_ascii=False),
-                form_html=form_html[:6000]
+                sender_json=json.dumps(sender_work, ensure_ascii=False),
+                form_html=form_html[:6000],
             )
             fill_data_str = self._call_claude(prompt)
-            fill_data = json.loads(fill_data_str)
+            fill_data = parse_json_from_model(fill_data_str)
+            if not isinstance(fill_data, dict):
+                raise ValueError("フォーム入力のAI応答がオブジェクトではありません")
 
-            # Step5: フォームに入力
             for key, value in fill_data.items():
                 try:
                     locator = page.locator(f'[name="{key}"], [id="{key}"]').first
-                    tag = await locator.evaluate('el => el.tagName.toLowerCase()')
-                    if tag == 'select':
+                    tag = await locator.evaluate("el => el.tagName.toLowerCase()")
+                    if tag == "select":
                         await locator.select_option(label=str(value))
                     else:
                         await locator.fill(str(value))
-                except:
+                except Exception:
                     pass
 
-            # Step6: テストモードは送信しない
             if self.test_mode:
-                result['status'] = '✅ 送信完了（テストモード・未送信）'
-                result['reason'] = 'テストモードのため実際の送信はしていません'
+                result["status"] = "✅ 送信完了（テストモード・未送信）"
+                result["reason"] = "テストモードのため実際の送信はしていません"
             else:
-                # 送信ボタンをクリック
                 submit = page.locator('button[type="submit"], input[type="submit"]').first
                 await submit.click()
                 await page.wait_for_timeout(2000)
-                result['status'] = '✅ 送信完了'
+                result["status"] = "✅ 送信完了"
 
             await page.close()
 
         except Exception as e:
-            result['status'] = '❌ 失敗'
-            result['reason'] = f'エラー: {str(e)[:100]}'
+            result["status"] = "❌ 失敗"
+            result["reason"] = f"エラー: {str(e)[:200]}"
 
         return result
 
     def _call_claude(self, prompt):
         message = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=self.model,
             max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
         )
         return message.content[0].text

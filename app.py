@@ -1,5 +1,4 @@
 import os
-import json
 import asyncio
 import threading
 from datetime import datetime
@@ -7,9 +6,18 @@ from flask import Flask, render_template, request, jsonify, send_file
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
 from engine import FormSender
+
+
+def _normalize_sender(payload):
+    keys = ('name', 'company', 'email', 'phone', 'message')
+    out = {k: '' for k in keys}
+    if not payload or not isinstance(payload, dict):
+        return out
+    for k in keys:
+        v = payload.get(k)
+        out[k] = (str(v).strip() if v is not None else '')
+    return out
 
 app = Flask(__name__)
 auth = HTTPBasicAuth()
@@ -64,14 +72,15 @@ def upload():
 @app.route('/run', methods=['POST'])
 @auth.login_required
 def run():
-    data = request.json
+    data = request.json or {}
     mode = data.get('mode', 'test')  # test or production
-    document_url = data.get('document_url', '')  # 画面から受け取る資料URL
+    document_url = (data.get('document_url') or '').strip()
+    sender = _normalize_sender(data.get('sender'))
     session_id = datetime.now().strftime('%Y%m%d%H%M%S')
     progress_store[session_id] = {'status': 'running', 'results': [], 'total': 0, 'done': 0}
 
     def run_async():
-        asyncio.run(execute(session_id, mode, document_url))
+        asyncio.run(execute(session_id, mode, document_url, sender))
 
     thread = threading.Thread(target=run_async)
     thread.start()
@@ -90,23 +99,19 @@ def download(session_id):
         return send_file(path, as_attachment=True, download_name='送信結果.xlsx')
     return jsonify({'error': 'ファイルが見つかりません'}), 404
 
-async def execute(session_id, mode, document_url=''):
+async def execute(session_id, mode, document_url='', sender=None):
     try:
-        # シート名に依存せず最初のシートからA列・B列を読み込む
+        # シート名に依存せず最初のシートからA列・B列を読み込む（/upload と同じ条件）
         df = pd.read_excel('uploads/companies.xlsx', header=0)
+        df.columns = [str(c).strip() for c in df.columns]
         df = df.iloc[:, :2]
         df.columns = ['会社名', 'URL']
         df = df.dropna(subset=['会社名', 'URL'])
+        df = df[df['会社名'].astype(str).str.strip() != '']
         df = df[df['URL'].astype(str).str.startswith('http')]
         companies = df.to_dict(orient='records')
 
-        sender = {
-            'name': '',
-            'company': '',
-            'email': '',
-            'phone': '',
-            'message': '',
-        }
+        sender = _normalize_sender(sender)
 
         progress_store[session_id]['total'] = len(companies)
         results = []
@@ -116,7 +121,7 @@ async def execute(session_id, mode, document_url=''):
 
         for i, company in enumerate(companies):
             # 会社名と資料URLを渡して追跡URLを自動生成
-            result = await sender_obj.process(company['会社名'], company['URL'], sender, document_url)
+            result = await sender_obj.process(company['会社名'], company['URL'], dict(sender), document_url)
             results.append(result)
             progress_store[session_id]['done'] = i + 1
             progress_store[session_id]['results'] = results
@@ -150,17 +155,22 @@ def save_result(session_id, results):
 
     status_colors = {'✅ 送信完了': 'E2EFDA', '❌ 失敗': 'FFE0E0', '⚠️ スキップ': 'FFF2CC'}
     for i, r in enumerate(results, 1):
+        ok = (r.get('status') or '').startswith('✅ 送信完了')
         row = [
             i,
             r['company'],
             r['status'],
             r.get('reason', '-'),
             r.get('tracking_url', '-'),  # 追跡URLを結果に追加
-            '要手動対応' if r['status'] != '✅ 送信完了' else '-',
+            '要手動対応' if not ok else '-',
             r.get('form_url', '-'),
             r.get('timestamp', '-')
         ]
-        color = status_colors.get(r['status'], 'FFFFFF')
+        st = r.get('status', '')
+        if st.startswith('✅ 送信完了'):
+            color = status_colors['✅ 送信完了']
+        else:
+            color = status_colors.get(st, 'FFFFFF')
         for col, val in enumerate(row, 1):
             cell = ws1.cell(row=i+1, column=col, value=val)
             cell.fill = PatternFill('solid', start_color=color)
@@ -175,7 +185,7 @@ def save_result(session_id, results):
         cell.fill = PatternFill('solid', start_color='843C0C')
         cell.border = border
 
-    manual = [r for r in results if r['status'] != '✅ 送信完了']
+    manual = [r for r in results if not (r.get('status') or '').startswith('✅ 送信完了')]
     for i, r in enumerate(manual, 1):
         row = [i, r['company'], r.get('top_url', '-'), r.get('reason', '-'), '□']
         for col, val in enumerate(row, 1):
